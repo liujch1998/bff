@@ -19,6 +19,7 @@ use std::thread::{available_parallelism};
 use flate2::Compression;
 use serde_json::Value;
 use threadpool::ThreadPool;
+use glob::glob;
 
 
 #[derive(Parser, Debug)]
@@ -90,13 +91,16 @@ struct Args {
 
     /// Input files. These are expected to be gzip compressed newline-delimited JSON files with a
     /// "text" field.
-    #[arg(index = 1)]
-    inputs: Vec<PathBuf>,
+    #[arg(long, short = 'i')]
+    input_directory: PathBuf,
 
     /// Output directory. The output files will have the same name as the input files, but be placed
     /// in this directory.
     #[arg(long, short = 'o')]
     output_directory: PathBuf,
+
+    #[arg(long, default_value_t = false)]
+    lowercase: bool,
 }
 
 fn tokenize(s: &str) -> impl Iterator<Item = &str> {
@@ -308,6 +312,7 @@ fn process_file(
     annotate_attribute_only: bool,
     whole_document: bool,
     whole_paragraphs: bool,
+    lowercase: bool,
 ) -> Result <(), io::Error> {
     let input_file = OpenOptions::new().
         read(true).
@@ -316,7 +321,7 @@ fn process_file(
         open(input_file)?;
     let reader = BufReader::with_capacity(
         1024 * 1024,
-        MultiGzDecoder::new(input_file));
+        input_file);
 
     let output_file = OpenOptions::new().
         read(false).
@@ -326,7 +331,7 @@ fn process_file(
         open(output_file)?;
     let mut writer = BufWriter::with_capacity(
         1024 * 1024,
-        GzEncoder::new(output_file, Compression::default()));
+        output_file);
 
     for line in reader.lines() {
         let line = line.unwrap();
@@ -349,11 +354,15 @@ fn process_file(
 
         for paragraph_window in newlines.windows(2) {
             let paragraph = &text[paragraph_window[0]..paragraph_window[1]];
+            let mut normalized_paragraph = paragraph.to_owned();
+            if lowercase {
+                normalized_paragraph = normalized_paragraph.to_lowercase();
+            }
 
             // calculate hashes for the paragraph
             let mut hashes: Vec<Vec<u64>> = Vec::new();
             let mut ngram: VecDeque<&str> = VecDeque::with_capacity(max_ngram_size);
-            for token in tokenize(paragraph) {
+            for token in tokenize(&normalized_paragraph) {
                 ngram.push_back(token);
                 // If not hashing whole paragraphs, add ngrams to the bloom filter as they reach max size
                 if !whole_paragraphs && ngram.len() >= max_ngram_size {
@@ -380,7 +389,8 @@ fn process_file(
                 contained_ngrams as f64 / number_of_ngrams as f64 > filtering_threshold;
             if too_many_duplicate_ngrams {
                 windows_to_remove.push(paragraph_window);
-            } else if update_bloom_filter {
+            }
+            if update_bloom_filter {
                 for ngram in hashes {
                     bloom_filter.insert_hashes(&ngram);
                 }
@@ -479,9 +489,21 @@ fn main() {
     }
 
     let threadpool = ThreadPool::new(threads);
-    for input in args.inputs {
+    // glob all .jsonl files under args.input_directory recursively
+    let inputs = glob(&format!("{}/**/*.jsonl", args.input_directory.display()))
+        .expect("Failed to read glob pattern")
+        .filter_map(|x| x.ok());
+
+    for input in inputs {
+        // Create the directory if not exist
+        let input_parent = input.parent().unwrap();
+        let relative_input_parent = input_parent.strip_prefix(&args.input_directory).unwrap();
+        let output_parent = args.output_directory.join(relative_input_parent);
+        std::fs::create_dir_all(&output_parent).unwrap();
+
+        let relative_input = input.strip_prefix(&args.input_directory).unwrap();
         let mut output = args.output_directory.clone();
-        output.push(&input.file_name().unwrap());
+        output.push(&relative_input);
         let bloom_filter = bloom_filter.clone();
 
         threadpool.execute(move || {
@@ -497,7 +519,8 @@ fn main() {
                 args.annotate_only,
                 args.annotate_attribute_only,
                 args.whole_document,
-                args.whole_paragraphs
+                args.whole_paragraphs,
+                args.lowercase
             ).unwrap();
         });
     }
